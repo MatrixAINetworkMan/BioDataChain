@@ -1,0 +1,14 @@
+# 本地配置（含密码、validator 地址）
+.env
+.env.bak
+
+# Validator 私钥 keystore —— 严禁入仓
+keystore/UTC--*
+
+# Password 文件
+secrets/password.txt
+password.txt
+
+# 渲染后的 genesis、临时文件
+workdir/genesis.json
+workdir/*.tmp

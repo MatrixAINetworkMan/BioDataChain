@@ -1,0 +1,22 @@
+{
+  "name": "man-spammer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Generate continuous L2 transaction load to populate Blockscout with realistic activity",
+  "scripts": {
+    "init": "node spammer.js init",
+    "grow": "node spammer.js grow",
+    "fund": "node spammer.js fund",
+    "spam": "node spammer.js spam",
+    "status": "node spammer.js status",
+    "consolidate": "node spammer.js consolidate",
+    "mint": "node spammer.js mint"
+  },
+  "dependencies": {
+    "viem": "^2.21.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

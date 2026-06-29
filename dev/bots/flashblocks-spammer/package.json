@@ -1,0 +1,17 @@
+{
+  "name": "flashblocks-spammer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Bundle-based TPS spammer for OP Stack + Flashblocks (op-rbuilder eth_sendBundle entry)",
+  "scripts": {
+    "spam": "node spammer.js"
+  },
+  "dependencies": {
+    "undici": "^6.19.0",
+    "viem": "^2.21.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

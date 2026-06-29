@@ -1,0 +1,56 @@
+# =============================================================================
+# op-deployer intent.toml — MyChain L2 dev 环境（CGT v2）
+#
+# 这份模板的字面值是 dev 默认；如果你的 .env 里改了 chain ID / owner，
+# 这份 intent 会由 dev/scripts/00-render-intent.sh 自动 envsubst 生成 intent.toml
+# =============================================================================
+
+configType            = "custom"
+l1ChainID             = ${L1_CHAIN_ID}
+# 注：fundDevAccounts 在 CGT v2 链下被 op-deployer v0.6.0 无视（验证过），所以
+# 这里设啥都没用。dev 账户的预 mint 改由 dev/scripts/02-deploy-genesis.sh 末尾
+# 直接 patch genesis.json + dev/scripts/03-init-geth.sh 重算 hash 完成。
+# 上 Sepolia/mainnet 时把 patch 步骤拿掉，资金通过桥接（OptimismPortal）进 L2。
+fundDevAccounts       = false
+useInterop            = false
+l1ContractsLocator    = "${L1_CONTRACTS_LOCATOR}"
+l2ContractsLocator    = "${L2_CONTRACTS_LOCATOR}"
+
+[superchainRoles]
+  SuperchainProxyAdminOwner = "${OWNER_MULTISIG}"
+  SuperchainGuardian        = "${OWNER_MULTISIG}"
+  ProtocolVersionsOwner     = "${OWNER_MULTISIG}"
+  Challenger                = "${OWNER_MULTISIG}"
+
+[[chains]]
+  id                          = "${L2_CHAIN_ID_HEX}"
+  baseFeeVaultRecipient       = "${FEE_RECIPIENT}"
+  l1FeeVaultRecipient         = "${FEE_RECIPIENT}"
+  sequencerFeeVaultRecipient  = "${FEE_RECIPIENT}"
+  operatorFeeVaultRecipient   = "${FEE_RECIPIENT}"
+  eip1559DenominatorCanyon    = 250
+  eip1559Denominator          = 50
+  eip1559Elasticity           = 6
+  gasLimit                    = ${L2_GAS_LIMIT}
+  operatorFeeScalar           = 0
+  operatorFeeConstant         = 0
+  # base fee 下限 = 1 gwei = 1_000_000_000 wei
+  # 即任何 tx 的有效 gas price 不会低于 1 gwei
+  # 主网/Sepolia 想"几乎免费"可以调回 1（=1 wei）
+  minBaseFee                  = 1000000000
+  daFootprintGasScalar        = 0
+
+  [chains.roles]
+    l1ProxyAdminOwner   = "${OWNER_MULTISIG}"
+    l2ProxyAdminOwner   = "${OWNER_MULTISIG}"
+    systemConfigOwner   = "${OWNER_MULTISIG}"
+    unsafeBlockSigner   = "${SEQUENCER_ADDRESS}"
+    batcher             = "${BATCHER_ADDRESS}"
+    proposer            = "${PROPOSER_ADDRESS}"
+    challenger          = "${OWNER_MULTISIG}"
+
+  [chains.customGasToken]
+    name                     = "${NATIVE_TOKEN_NAME}"
+    symbol                   = "${NATIVE_TOKEN_SYMBOL}"
+    initialLiquidity         = "${NATIVE_INITIAL_LIQUIDITY}"
+    liquidityControllerOwner = "${OWNER_MULTISIG}"

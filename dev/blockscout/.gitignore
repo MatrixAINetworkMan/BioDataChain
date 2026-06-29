@@ -1,0 +1,10 @@
+# 渲染后的 env（含本机 IP / 临时配置），不入仓
+envs/backend.env
+envs/frontend.env
+
+# 本地预生成的 favicon 套件（由 scripts/blockscout-make-favicon.sh 在 blockscout-up
+# 时自动生成；二进制 PNG/ICO 没必要入仓，且 owner 在 docker 跑完会变）
+assets/favicon/
+
+# 链指纹快照（每次 blockscout-up 自动写，不入仓）
+.chain-fingerprint

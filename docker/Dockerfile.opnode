@@ -1,0 +1,28 @@
+FROM golang:1.21-bookworm AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git make gcc libc-dev nodejs npm && \
+    npm install -g pnpm@8 && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+RUN git clone https://github.com/bnb-chain/opbnb.git . && \
+    git checkout develop && \
+    pnpm install && \
+    make op-node op-batcher op-proposer
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl jq && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/op-node/bin/op-node /usr/local/bin/op-node
+COPY --from=builder /build/op-batcher/bin/op-batcher /usr/local/bin/op-batcher
+COPY --from=builder /build/op-proposer/bin/op-proposer /usr/local/bin/op-proposer
+
+RUN useradd -m -s /bin/bash opstack
+USER opstack
+WORKDIR /home/opstack
+
+ENTRYPOINT ["/bin/bash"]

@@ -1,0 +1,24 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "op-geth-sequencer"
+    metrics_path: /debug/metrics/prometheus
+    static_configs:
+      - targets: ["op-geth:6060"]
+        labels:
+          instance: "sequencer"
+          component: "execution"
+
+  - job_name: "op-node-sequencer"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["op-node:7070"]
+        labels:
+          instance: "sequencer"
+          component: "consensus"
+
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]

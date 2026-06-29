@@ -1,0 +1,97 @@
+{
+    "l1ChainID": 97,
+    "l2ChainID": 42170,
+    "l2BlockTime": 3,
+    "maxSequencerDrift": 600,
+    "sequencerWindowSize": 57600,
+    "channelTimeout": 1200,
+
+    "p2pSequencerAddress": "$GS_SEQUENCER_ADDRESS",
+    "batchInboxAddress": "0xff00000000000000000000000000000000042170",
+    "batchSenderAddress": "$GS_BATCHER_ADDRESS",
+
+    "cliqueSignerAddress": "0x0000000000000000000000000000000000000000",
+    "l1UseClique": false,
+
+    "l1StartingBlockTag": "REPLACE_WITH_L1_BLOCK_TAG",
+    "l2OutputOracleSubmissionInterval": 3600,
+    "l2OutputOracleStartingBlockNumber": 0,
+    "l2OutputOracleStartingTimestamp": 0,
+    "l2OutputOracleProposer": "$GS_PROPOSER_ADDRESS",
+    "l2OutputOracleChallenger": "$GS_ADMIN_ADDRESS",
+
+    "l2GenesisBlockGasLimit": "0x5f5e100",
+    "l1BlockTime": 3,
+
+    "baseFeeVaultMinimumWithdrawalAmount": "0x8ac7230489e80000",
+    "l1FeeVaultMinimumWithdrawalAmount": "0x8ac7230489e80000",
+    "sequencerFeeVaultMinimumWithdrawalAmount": "0x8ac7230489e80000",
+    "baseFeeVaultWithdrawalNetwork": 0,
+    "l1FeeVaultWithdrawalNetwork": 0,
+    "sequencerFeeVaultWithdrawalNetwork": 0,
+
+    "proxyAdminOwner": "$GS_ADMIN_ADDRESS",
+    "baseFeeVaultRecipient": "$GS_ADMIN_ADDRESS",
+    "l1FeeVaultRecipient": "$GS_ADMIN_ADDRESS",
+    "sequencerFeeVaultRecipient": "$GS_ADMIN_ADDRESS",
+    "finalSystemOwner": "$GS_ADMIN_ADDRESS",
+    "superchainConfigGuardian": "$GS_ADMIN_ADDRESS",
+
+    "finalizationPeriodSeconds": 604800,
+    "fundDevAccounts": false,
+    "l2GenesisBlockBaseFeePerGas": "0x5F5E100",
+
+    "gasPriceOracleOverhead": 2100,
+    "gasPriceOracleScalar": 1000000,
+    "gasPriceOracleBaseFeeScalar": 1368,
+    "gasPriceOracleBlobBaseFeeScalar": 810949,
+
+    "enableGovernance": true,
+    "governanceTokenSymbol": "MAN",
+    "governanceTokenName": "Matrix AI Network",
+    "governanceTokenOwner": "$GS_ADMIN_ADDRESS",
+
+    "eip1559Denominator": 8,
+    "eip1559DenominatorCanyon": 8,
+    "eip1559Elasticity": 2,
+
+    "l1GenesisBlockTimestamp": "REPLACE_WITH_L1_TIMESTAMP_HEX",
+    "l2GenesisRegolithTimeOffset": "0x0",
+    "l2GenesisDeltaTimeOffset": "0x0",
+    "l2GenesisCanyonTimeOffset": "0x0",
+
+    "systemConfigStartBlock": 0,
+    "requiredProtocolVersion": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "recommendedProtocolVersion": "0x0000000000000000000000000000000000000000000000000000000000000000",
+
+    "faultGameAbsolutePrestate": "0x03c7ae758795765c6664a5d39bf63841c71ff191e9189522bad8ebff5d4eca98",
+    "faultGameMaxDepth": 50,
+    "faultGameClockExtension": 0,
+    "faultGameMaxClockDuration": 1200,
+    "faultGameGenesisBlock": 0,
+    "faultGameGenesisOutputRoot": "0xDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF",
+    "faultGameSplitDepth": 14,
+    "faultGameWithdrawalDelay": 604800,
+    "preimageOracleMinProposalSize": 10000,
+    "preimageOracleChallengePeriod": 120,
+    "proofMaturityDelaySeconds": 12,
+    "disputeGameFinalityDelaySeconds": 6,
+    "respectedGameType": 254,
+    "useFaultProofs": false,
+
+    "usePlasma": false,
+    "daCommitmentType": "KeccakCommitment",
+    "daChallengeWindow": 160,
+    "daResolveWindow": 160,
+    "daBondSize": 1000000,
+    "daResolverRefundPercentage": 0,
+
+    "customGasTokenAddress": "REPLACE_WITH_DEPLOYED_TOKEN_ADDRESS",
+
+    "fermat": 0,
+    "L2GenesisEcotoneTimeOffset": "0x0",
+    "l2GenesisFjordTimeOffset": "0x0",
+    "snowTimeOffset": "0x0",
+    "haberTimeOffset": "0x0",
+    "wrightTimeOffset": "0x0"
+}

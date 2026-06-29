@@ -1,0 +1,258 @@
+version: "3.8"
+
+# =============================================================================
+# MyChain L2 - Docker Compose Production Deployment
+#
+# Prerequisites:
+#   1. Place genesis.json, rollup.json, jwt.txt in ./data/
+#   2. Initialize op-geth: docker compose run --rm op-geth-init
+#   3. Copy .env.example to .env and fill in values
+#   4. Start: docker compose up -d
+# =============================================================================
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "10"
+
+services:
+  # =========================================================================
+  # op-geth init (run once to initialize the datadir)
+  # =========================================================================
+  op-geth-init:
+    build:
+      context: .
+      dockerfile: Dockerfile.opgeth
+    entrypoint: ["geth", "init",
+      "--datadir=/data/geth",
+      "--state.scheme=path",
+      "--db.engine=pebble",
+      "/config/genesis.json"
+    ]
+    volumes:
+      - opgeth-data:/data/geth
+      - ./data/genesis.json:/config/genesis.json:ro
+    profiles: ["init"]
+
+  # =========================================================================
+  # op-geth (Sequencer Execution Client)
+  # =========================================================================
+  op-geth:
+    build:
+      context: .
+      dockerfile: Dockerfile.opgeth
+    restart: unless-stopped
+    stop_grace_period: 30s
+    entrypoint: ["geth"]
+    command:
+      - --datadir=/data/geth
+      - --http
+      - --http.corsdomain=*
+      - --http.vhosts=*
+      - --http.addr=0.0.0.0
+      - --http.port=8545
+      - --http.api=web3,debug,eth,txpool,net,engine
+      - --ws
+      - --ws.addr=0.0.0.0
+      - --ws.port=8546
+      - --ws.origins=*
+      - --ws.api=debug,eth,txpool,net,engine
+      - --syncmode=full
+      - --gcmode=archive
+      - --mine
+      - --miner.newpayload-timeout=650ms
+      - --miner.gaslimit=150000000
+      - --miner.gasprice=1
+      - --miner.etherbase=${GS_SEQUENCER_ADDRESS}
+      - --nodiscover
+      - --maxpeers=10
+      - --networkid=${L2_CHAIN_ID:-42170}
+      - --authrpc.vhosts=*
+      - --authrpc.addr=0.0.0.0
+      - --authrpc.port=8551
+      - --authrpc.jwtsecret=/config/jwt.txt
+      - --txpool.globalslots=20000
+      - --txpool.globalqueue=10000
+      - --txpool.accountqueue=500
+      - --txpool.accountslots=500
+      - --txpool.pricelimit=1
+      - --txpool.nolocals=true
+      - --txpool.reannouncetime=3m
+      - --txpool.reannounceremotes=true
+      - --cache=20000
+      - --cache.preimages
+      - --rollup.disabletxpoolgossip=false
+      - --pathdb.nodebuffer=list
+      - --pathdb.proposeblock=3600
+      - --pathdb.enableproofkeeper
+      - --metrics
+      - --metrics.port=6060
+      - --metrics.addr=0.0.0.0
+      - --verbosity=3
+    ports:
+      - "${OPGETH_HTTP_PORT:-8545}:8545"
+      - "${OPGETH_WS_PORT:-8546}:8546"
+    expose:
+      - "8551"
+      - "6060"
+    volumes:
+      - opgeth-data:/data/geth
+      - ./data/jwt.txt:/config/jwt.txt:ro
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8545", "-X", "POST",
+             "-H", "Content-Type: application/json",
+             "-d", "{\"jsonrpc\":\"2.0\",\"method\":\"eth_blockNumber\",\"params\":[],\"id\":1}"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging: *logging
+
+  # =========================================================================
+  # op-node (Sequencer Consensus Client)
+  # =========================================================================
+  op-node:
+    build:
+      context: .
+      dockerfile: Dockerfile.opnode
+    restart: unless-stopped
+    stop_grace_period: 30s
+    entrypoint: ["op-node"]
+    command:
+      - --l1.trustrpc
+      - --l2=http://op-geth:8551
+      - --l2.jwt-secret=/config/jwt.txt
+      - --sequencer.enabled=true
+      - --sequencer.l1-confs=15
+      - --sequencer.combined-engine
+      - --verifier.l1-confs=15
+      - --l1.http-poll-interval=3s
+      - --l1.epoch-poll-interval=3s
+      - --l1.rpc-max-batch-size=20
+      - --rollup.config=/config/rollup.json
+      - --rpc.addr=0.0.0.0
+      - --rpc.port=8547
+      - --rpc.enable-admin
+      - --sequencer.priority
+      - --l1.max-concurrency=20
+      - --p2p.sequencer.key=${GS_SEQUENCER_PRIVATE_KEY}
+      - --l1=${L1_RPC_URL}
+      - --l1.rpckind=${L1_RPC_KIND:-standard}
+      - --metrics.enabled
+      - --metrics.port=7070
+      - --metrics.addr=0.0.0.0
+    ports:
+      - "${OPNODE_RPC_PORT:-8547}:8547"
+    expose:
+      - "7070"
+    volumes:
+      - ./data/jwt.txt:/config/jwt.txt:ro
+      - ./data/rollup.json:/config/rollup.json:ro
+    depends_on:
+      op-geth:
+        condition: service_healthy
+    logging: *logging
+
+  # =========================================================================
+  # op-batcher
+  # =========================================================================
+  op-batcher:
+    build:
+      context: .
+      dockerfile: Dockerfile.opnode
+    restart: unless-stopped
+    stop_grace_period: 30s
+    entrypoint: ["op-batcher"]
+    command:
+      - --l2-eth-rpc=http://op-geth:8545
+      - --rollup-rpc=http://op-node:8547
+      - --poll-interval=5s
+      - --sub-safety-margin=30
+      - --num-confirmations=4
+      - --safe-abort-nonce-too-low-count=3
+      - --resubmission-timeout=30s
+      - --rpc.addr=0.0.0.0
+      - --rpc.port=8548
+      - --batch-type=1
+      - --data-availability-type=auto
+      - --target-num-frames=2
+      - --rpc.enable-admin
+      - --max-channel-duration=20
+      - --l1-eth-rpc=${L1_RPC_URL}
+      - --private-key=${GS_BATCHER_PRIVATE_KEY}
+    ports:
+      - "${OPBATCHER_RPC_PORT:-8548}:8548"
+    depends_on:
+      op-geth:
+        condition: service_healthy
+    logging: *logging
+
+  # =========================================================================
+  # op-proposer
+  # =========================================================================
+  op-proposer:
+    build:
+      context: .
+      dockerfile: Dockerfile.opnode
+    restart: unless-stopped
+    stop_grace_period: 30s
+    entrypoint: ["op-proposer"]
+    command:
+      - --poll-interval=1s
+      - --rpc.port=8560
+      - --rollup-rpc=http://op-node:8547
+      - --l2oo-address=${L2_OUTPUT_ORACLE_PROXY}
+      - --private-key=${GS_PROPOSER_PRIVATE_KEY}
+      - --l1-eth-rpc=${L1_RPC_URL}
+    ports:
+      - "${OPPROPOSER_RPC_PORT:-8560}:8560"
+    depends_on:
+      op-geth:
+        condition: service_healthy
+    logging: *logging
+
+  # =========================================================================
+  # Prometheus
+  # =========================================================================
+  prometheus:
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    volumes:
+      - ../monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=30d
+      - --web.enable-lifecycle
+    logging: *logging
+
+  # =========================================================================
+  # Grafana
+  # =========================================================================
+  grafana:
+    image: grafana/grafana:latest
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-mychain2024}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ../monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    logging: *logging
+
+volumes:
+  opgeth-data:
+    driver: local
+  prometheus-data:
+    driver: local
+  grafana-data:
+    driver: local

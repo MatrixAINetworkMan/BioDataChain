@@ -1,0 +1,41 @@
+# Build
+contracts/out/
+contracts/cache/
+contracts/broadcast/
+
+# Foundry toolchain / solc installed into the workspace (local only)
+.foundry/
+.svm/
+
+# Environment
+.env
+.envrc
+!.envrc.example
+config/.envrc
+!config/.envrc.example
+
+# Node
+node_modules/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Chain data
+data/
+datadir/
+genesis.json
+rollup.json
+jwt.txt
+
+# Secrets
+*.key
+*.pem
+
+# Logs
+*.log
+logs/
+
+# IDE
+.idea/
+.vscode/

@@ -1,0 +1,110 @@
+# =============================================================================
+# Override：用持久外部 L1 (e.g. self-hosted Geth Clique on chain-l1-test) 替
+# 代内嵌 anvil。anvil 模式（默认）不受影响。
+#
+# 启用方式：在 .env 里加这三行（其余配置不动）
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.external-l1.yml
+#   L1_RPC_URL_INTERNAL=http://l1-proxy:8546        # docker 内部走 proxy
+#   L1_RPC_URL_EXTERNAL=http://<外部 L1 IP>:8545    # op-deployer 等容器/脚本直连用
+#   L1_PROXY_UPSTREAM=http://<外部 L1 IP>:8545      # l1-proxy 的转发目标（一般同上）
+#
+# 然后 make deploy-l1 / deploy-genesis / init-geth / l2-up 一切照旧；
+# 不需要再跑 make l1-up（anvil 已被 profile 关闭）。
+#
+# 为什么需要 l1-proxy:
+#   op-batcher v1.16.7 在 calldata 模式下也强制查 eth_blobBaseFee（估 blob gas）。
+#   Geth Clique（无 Cancun）不暴露这个 method → batcher 永远 "will retry"
+#   → L2 在出块但 batch 没人提交 → safe head 永远不动。
+#   proxy 拦截这个 method 返回 0x1，其他 RPC 一律透传，op-batcher 就能正常 post
+#   calldata batch。
+# =============================================================================
+
+services:
+
+  # ===========================================================================
+  # L1 JSON-RPC proxy（解 op-batcher 强制查 eth_blobBaseFee 的卡死）
+  # ===========================================================================
+  l1-proxy:
+    image: python:3.12-alpine
+    container_name: l1-proxy
+    restart: unless-stopped
+    volumes:
+      - ./l1-proxy/proxy.py:/app/proxy.py:ro
+    environment:
+      UPSTREAM: ${L1_PROXY_UPSTREAM:?需要在 .env 设 L1_PROXY_UPSTREAM 指向外部 L1 URL}
+    command: ["python3", "/app/proxy.py"]
+    # 注：python:3.12-alpine 镜像里 wget 是 busybox 版，不支持 --post-data
+    # （那是 GNU wget 的 flag）。直接用 python 自己做 health probe：
+    # 调 eth_blobBaseFee（proxy 本地拦截的 method），同时验证：
+    #   1) python 进程活着
+    #   2) HTTP server listen 在 8546
+    #   3) intercept 逻辑工作（返回了 "result" 字段）
+    # 不依赖 upstream L1，即使外部 L1 暂时抖动 proxy 自己仍 healthy。
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - |-
+          import urllib.request as u
+          r = u.urlopen(u.Request(
+              "http://127.0.0.1:8546",
+              data=b'{"jsonrpc":"2.0","id":1,"method":"eth_blobBaseFee","params":[]}',
+              headers={"Content-Type": "application/json"}
+          ), timeout=3)
+          assert b'"result"' in r.read()
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    networks: [mychain]
+
+  # ===========================================================================
+  # 关掉内嵌 anvil：external-L1 模式下不需要它。
+  # 用一个不会被默认启用的 profile 把它"软隐藏"（不影响 anvil 模式下的 base file）。
+  # ===========================================================================
+  anvil:
+    profiles: ["_disabled_by_external_l1"]
+
+  # ===========================================================================
+  # 各 op-* 服务的 depends_on 改 anvil → l1-proxy。
+  # 注：compose 对 depends_on map 默认做 merge，如果只在这里追加 l1-proxy，
+  # anvil 那一项还在 → compose 报 "depends on undefined service anvil"
+  # （anvil 被 profile 关掉了，对它来说就是 undefined）。
+  # 用 !override 完全替换原 map。需要 docker compose v2.20+。
+  # ===========================================================================
+  op-deployer:
+    depends_on: !override
+      l1-proxy:
+        condition: service_healthy
+
+  op-geth-init:
+    depends_on: !override
+      l1-proxy:
+        condition: service_healthy
+
+  op-node:
+    depends_on: !override
+      op-geth:
+        condition: service_healthy
+      l1-proxy:
+        condition: service_healthy
+
+  op-batcher:
+    depends_on: !override
+      op-node:
+        condition: service_healthy
+      l1-proxy:
+        condition: service_healthy
+
+  op-proposer:
+    depends_on: !override
+      op-node:
+        condition: service_healthy
+      l1-proxy:
+        condition: service_healthy

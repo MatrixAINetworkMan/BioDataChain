@@ -1,0 +1,6 @@
+envs/backend.env
+envs/frontend.env
+
+# 本地预生成的 favicon 套件（由 dev/l1/scripts/blockscout-make-favicon.sh
+# 在 blockscout-up 时自动生成；二进制 PNG/ICO 没必要入仓）
+assets/favicon/

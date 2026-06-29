@@ -1,0 +1,190 @@
+# =============================================================================
+# Blockscout 独立部署（Optimism flavor）—— 单机自包含版
+#
+# 跟链仓库里的 dev/blockscout/docker-compose.yml 的区别：
+#   1. 用自己的内部 docker 网络 blockscout-net，不再 external 挂主链 mychain-dev
+#   2. indexer 的 L2/L1 RPC 走 env 里的远程地址，不是容器 DNS op-geth:8545
+#   3. 镜像、端口、域名全部 .env 驱动
+#
+# 8 个服务：db / redis / backend / frontend / smart-contract-verifier /
+#           sig-provider / stats-db / stats
+#
+# 拉起：./install.sh        停止：docker compose down        清库：docker compose down -v
+# =============================================================================
+name: blockscout
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+services:
+
+  db:
+    image: postgres:16-alpine
+    container_name: blockscout-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: blockscout
+      POSTGRES_USER: blockscout
+      POSTGRES_PASSWORD: blockscout
+    volumes:
+      - bs-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U blockscout"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    logging: *default-logging
+    networks: [blockscout]
+
+  redis:
+    image: redis:7-alpine
+    container_name: blockscout-redis
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    volumes:
+      - bs-redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    logging: *default-logging
+    networks: [blockscout]
+
+  backend:
+    image: ${BLOCKSCOUT_BACKEND_IMAGE}
+    container_name: blockscout-backend
+    restart: unless-stopped
+    stop_grace_period: 30s
+    stop_signal: SIGTERM
+    # backend 对 L2 RPC 每请求新建 TCP 连接、用完即关，大回填时会把容器 netns 的临时端口
+    # 全部 churn 进 TIME_WAIT（默认范围仅 ~28k），导致 connect() 报 EADDRNOTAVAIL、索引卡死。
+    # 放宽临时端口段 + 允许复用 TIME_WAIT（仅对出站安全），按容器隔离生效。
+    sysctls:
+      - net.ipv4.ip_local_port_range=1024 65535
+      - net.ipv4.tcp_tw_reuse=1
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command:
+      - sh
+      - -c
+      - 'bin/blockscout eval "Elixir.Explorer.ReleaseTasks.create_and_migrate()" && bin/blockscout start'
+    env_file:
+      - ./envs/backend.env
+    ports:
+      - "${BLOCKSCOUT_API_PORT}:4000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:4000/api/v2/blocks 2>/dev/null | grep -q '\"items\"' || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 30
+      start_period: 120s
+    logging: *default-logging
+    networks: [blockscout]
+
+  smart-contract-verifier:
+    image: ${BLOCKSCOUT_VERIFIER_IMAGE}
+    container_name: blockscout-verifier
+    restart: unless-stopped
+    environment:
+      SMART_CONTRACT_VERIFIER__SERVER__HTTP__ADDR: 0.0.0.0:8050
+      SMART_CONTRACT_VERIFIER__SERVER__GRPC__ENABLED: "false"
+    logging: *default-logging
+    networks: [blockscout]
+
+  sig-provider:
+    image: ${BLOCKSCOUT_SIG_PROVIDER_IMAGE}
+    container_name: blockscout-sig-provider
+    restart: unless-stopped
+    environment:
+      SIG_PROVIDER__SERVER__HTTP__ADDR: 0.0.0.0:8043
+    logging: *default-logging
+    networks: [blockscout]
+
+  stats-db:
+    image: postgres:16-alpine
+    container_name: blockscout-stats-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: stats
+      POSTGRES_USER: stats
+      POSTGRES_PASSWORD: stats
+    volumes:
+      - bs-stats-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stats"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    logging: *default-logging
+    networks: [blockscout]
+
+  stats:
+    image: ${BLOCKSCOUT_STATS_IMAGE}
+    container_name: blockscout-stats
+    restart: unless-stopped
+    depends_on:
+      stats-db:
+        condition: service_healthy
+      backend:
+        condition: service_started
+    environment:
+      STATS__RUN_MIGRATIONS: "true"
+      STATS__CREATE_DATABASE: "true"
+      STATS__SERVER__HTTP__ADDR: 0.0.0.0:8050
+      STATS__SERVER__HTTP__ENABLED: "true"
+      STATS__SERVER__GRPC__ENABLED: "false"
+      STATS__DB_URL: postgres://stats:stats@stats-db:5432/stats
+      STATS__BLOCKSCOUT_DB_URL: postgres://blockscout:blockscout@db:5432/blockscout
+      STATS__BLOCKSCOUT_API_URL: http://backend:4000
+      STATS__ENABLE_ALL_OP_STACK: "true"
+      STATS__SERVER__HTTP__CORS__ENABLED: "true"
+      STATS__SERVER__HTTP__CORS__ALLOWED_ORIGIN: "*"
+    ports:
+      - "${BLOCKSCOUT_STATS_PORT}:8050"
+    logging: *default-logging
+    networks: [blockscout]
+
+  frontend:
+    image: ${BLOCKSCOUT_FRONTEND_IMAGE}
+    container_name: blockscout-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    env_file:
+      - ./envs/frontend.env
+    ports:
+      - "${BLOCKSCOUT_PORT}:3000"
+    # logo / icon / favicon 直接挂死，绕过 entrypoint 回源下载（详见链仓库注释）。
+    # assets/ 目录从链仓库 dev/blockscout/assets 拷过来即可。
+    # 注意：configs/network_*.svg 不挂 :ro —— v2.8.0 entrypoint 会用 file:// 源 cp 到这里（见
+    #   envs/frontend.env.tpl 注释），:ro 会让 cp 失败；源文件由下面 :/network 挂载提供。
+    volumes:
+      - ./assets:/app/public/assets/network:ro
+      - ./assets/favicon/favicon.ico:/app/public/assets/favicon/favicon.ico:ro
+      - ./assets/favicon/favicon-16x16.png:/app/public/assets/favicon/favicon-16x16.png:ro
+      - ./assets/favicon/favicon-32x32.png:/app/public/assets/favicon/favicon-32x32.png:ro
+      - ./assets/favicon/favicon-48x48.png:/app/public/assets/favicon/favicon-48x48.png:ro
+      - ./assets/favicon/favicon-96x96.png:/app/public/assets/favicon/favicon-96x96.png:ro
+      - ./assets/favicon/apple-touch-icon-180x180.png:/app/public/assets/favicon/apple-touch-icon-180x180.png:ro
+      - ./assets/favicon/android-chrome-192x192.png:/app/public/assets/favicon/android-chrome-192x192.png:ro
+      - ./assets/favicon/android-chrome-512x512.png:/app/public/assets/favicon/android-chrome-512x512.png:ro
+      - ./assets/favicon/favicon.ico:/app/public/favicon.ico:ro
+    logging: *default-logging
+    networks: [blockscout]
+
+networks:
+  blockscout:
+    name: blockscout-net
+    driver: bridge
+
+volumes:
+  bs-db:
+  bs-redis:
+  bs-stats-db:

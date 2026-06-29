@@ -1,0 +1,338 @@
+# =============================================================================
+# MyChain L2 — dev 环境（B 阶段 docker-compose）
+#
+# 拓扑：anvil(L1)  -->  op-deployer(一次性) --> op-geth + op-node + op-batcher
+#                                                  ^             (op-proposer 走 profile=proposer，dev 默认不起)
+#                                                  |
+# 区块浏览器（Blockscout 完整版）走独立的 dev/blockscout/docker-compose.yml，
+# 加在外部网络 mychain-dev 上。Make target：blockscout-up / blockscout-down。
+#
+# 使用：见 dev/README.md
+# =============================================================================
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+services:
+
+  # ===========================================================================
+  # L1: anvil（假以太坊，无限 ETH，零 gas，启动 < 5 秒）
+  # ===========================================================================
+  anvil:
+    image: ${ANVIL_IMAGE}
+    container_name: mychain-anvil
+    restart: unless-stopped
+    entrypoint: ["anvil"]
+    command:
+      - --host=0.0.0.0
+      - --port=8545
+      - --chain-id=${L1_CHAIN_ID}
+      - --block-time=${L1_BLOCK_TIME}
+      - --balance=10000
+      - --accounts=10
+      - --hardfork=cancun
+      # 固定 mnemonic：不设置时 anvil 每次启动会随机生成 mnemonic，导致预生成账号
+      # 不同 → genesis state 不同 → genesis hash 每次都不一样。op-node 一旦持久化了
+      # 当时的 L1 genesis hash，下次 anvil 重启就会因为 hash 对不上拒绝继续 derive，
+      # 整条链失联（曾在 2026-05-27 服务器重启时踩过，丢了 110w+ L2 块）。
+      # 用 foundry 内置 "test junk" mnemonic，纯 dev 用途无安全风险。
+      # 替换为你的 dev 助记词（不要入仓真实助记词）：
+      - --mnemonic=${ANVIL_MNEMONIC:?Set ANVIL_MNEMONIC in .env}
+      # state 持久化：anvil 每 state-interval 秒把世界状态 dump 到这个文件，重启时
+      # 优先从此文件恢复。配合 --mnemonic 固定，是 dev 链能跨重启的关键。
+      - --state=/data/anvil-state.json
+      - --state-interval=5
+      - --timestamp=${ANVIL_GENESIS_TIMESTAMP}
+      - --silent
+    volumes:
+      - anvil-data:/data
+    ports:
+      - "${ANVIL_PORT}:8545"
+    healthcheck:
+      test: ["CMD-SHELL", "cast block-number --rpc-url http://localhost:8545 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    logging: *default-logging
+    networks: [mychain]
+
+  # ===========================================================================
+  # op-deployer（一次性容器，由 scripts/01-deploy.sh 调用，profile=deploy）
+  # 不在默认 up 时启动；脚本通过 `docker compose run --rm op-deployer ...` 调用
+  # ===========================================================================
+  op-deployer:
+    image: ${OP_DEPLOYER_IMAGE}
+    container_name: mychain-op-deployer
+    profiles: ["deploy"]
+    entrypoint: ["op-deployer"]
+    working_dir: /workdir
+    volumes:
+      - ./workdir:/workdir
+    networks: [mychain]
+    depends_on:
+      anvil:
+        condition: service_healthy
+
+  # ===========================================================================
+  # op-geth-init（一次性，从 genesis.json 初始化 op-geth 数据目录）
+  # 注意：state.scheme 必须跟 op-geth runtime 用同一个，否则 op-geth 起不来
+  #       (hash/path 是物理布局，不能互转，data dir 必须 fresh 才能切)
+  # ===========================================================================
+  op-geth-init:
+    image: ${OP_GETH_IMAGE}
+    container_name: mychain-op-geth-init
+    profiles: ["deploy"]
+    entrypoint: ["geth"]
+    command:
+      - init
+      - --datadir=/data/geth
+      - --state.scheme=${OP_GETH_STATE_SCHEME:-path}
+      - /shared/genesis.json
+    volumes:
+      - opgeth-data:/data/geth
+      - ./workdir/shared:/shared:ro
+    networks: [mychain]
+
+  # ===========================================================================
+  # op-geth（L2 执行客户端）
+  # ===========================================================================
+  op-geth:
+    image: ${OP_GETH_IMAGE}
+    container_name: mychain-op-geth
+    restart: unless-stopped
+    stop_grace_period: 30s
+    entrypoint: ["geth"]
+    command:
+      - --datadir=/data/geth
+      - --networkid=${L2_CHAIN_ID}
+      - --syncmode=full
+      # === 压测模式（默认）===
+      # gcmode=full + state.scheme=path：压测必备组合，TPS 比 archive+hash 快 5-10x。
+      #   - full: 不留历史 state（无法 debug_traceTransaction 老 tx）
+      #   - path: 新 trie 实现，写入 IO 减半，state 大时不再 IO bound
+      # 想看历史 state？切回 gcmode=archive + state.scheme=hash（重建链，数据丢）。
+      - --gcmode=${OP_GETH_GCMODE:-full}
+      - --state.scheme=${OP_GETH_STATE_SCHEME:-path}
+      # === state trie cache ===
+      # 默认 --cache=1024 MB，分给 trie/db/snapshot 后实际 trie cache 仅 ~600MB。
+      # 跑 30k+ 账户、长时间 spam 时 trie hit rate 会暴跌 → state 读取变 disk IO bound。
+      # 加到 8GB（host 18GB 内存够），命中率拉满，commit 块加速明显。
+      - --cache=${OP_GETH_CACHE_MB:-8192}
+      - --cache.trie=${OP_GETH_CACHE_TRIE_PCT:-50}      # 50% 给 trie cache（默认 25%）
+      - --cache.gc=${OP_GETH_CACHE_GC_PCT:-25}          # 25% 给 gc（默认 25%）
+      - --cache.snapshot=${OP_GETH_CACHE_SNAP_PCT:-15}  # 15% 给 snapshot（默认 10%）
+      - --http
+      - --http.addr=0.0.0.0
+      - --http.port=8545
+      - --http.corsdomain=*
+      - --http.vhosts=*
+      - --http.api=web3,debug,eth,txpool,net,engine,miner
+      - --ws
+      - --ws.addr=0.0.0.0
+      - --ws.port=8546
+      - --ws.origins=*
+      - --ws.api=debug,eth,txpool,net,engine
+      - --authrpc.addr=0.0.0.0
+      - --authrpc.port=8551
+      - --authrpc.vhosts=*
+      - --authrpc.jwtsecret=/shared/jwt.txt
+      - --rollup.disabletxpoolgossip=true
+      - --nodiscover
+      - --maxpeers=0
+      # 不在 mempool 层强制最小 tip：链上的 minBaseFee = 1 gwei 已经保证
+      # 任何 tx 的 effective gas price ≥ 1 gwei；这里设 1 wei 是为了允许
+      # 钱包发"tip = 0"的 EIP-1559 交易（最常见情况）。
+      - --txpool.pricelimit=1
+      # === txpool 容量（2025-04 加，2026-05 参数化，2026-05-04 v6 默认改 fail-fast）===
+      # geth 默认 GlobalSlots=4096 / AccountSlots=16。
+      # 两种模式（通过 .env 切换）：
+      #   1) fail-fast 模式（v6 默认 / 一期生产 baseline）：
+      #      globalslots=500 / accountslots=8
+      #      → 链稳态消化 ~158-180 TPS，3 块 buffer
+      #      → 入流量 > 链消化能力时立即返回 "txpool is full"
+      #      → 实测 1000 TPS 攻击下链稳定不雪崩，mempool 稳定在 500-700
+      #   2) 容量模式（仅用于"宁愿排队不愿失败"的特殊场景）：
+      #      globalslots=20000 / accountslots=128
+      #      → mempool 当大缓冲，攻击时会爆炸不推荐生产用
+      # 详见 STRESS_TEST_REPORT.md §13 §14
+      - --txpool.globalslots=${OP_GETH_TXPOOL_GLOBALSLOTS:-500}
+      - --txpool.globalqueue=${OP_GETH_TXPOOL_GLOBALQUEUE:-200}
+      - --txpool.accountslots=${OP_GETH_TXPOOL_ACCOUNTSLOTS:-8}
+      - --txpool.accountqueue=${OP_GETH_TXPOOL_ACCOUNTQUEUE:-16}
+      # JSON-RPC batch：默认 batch-request-limit=1000，spam 一批 50 笔够用
+      # 但响应里有错误信息时 size 会超 25MB 默认上限，提高到 50MB
+      - --rpc.batch-request-limit=2000
+      - --rpc.batch-response-max-size=50000000
+      - --rpc.gascap=100000000          # eth_call gas cap，跟 L2_GAS_LIMIT 一致（业务方需求 100M block）
+      # === miner / sequencer worker 调优 ===
+      # recommit = worker 多久从 mempool 重新拉 tx 塞进当前 pending block。
+      # 实测：1s block_time 下，worker 50-200ms 就把首批 ~100 笔装完然后 idle 等 getPayload，
+      # 期间 spammer 又发 ~900 笔但全错过这个 block → 永远 ~100 TPS。
+      # 200ms recommit = 在 1s window 里 worker 重新 fillTransactions 4-5 次，
+      # 每次把新到的 tx 也塞进来，block 能装 600+ 笔。
+      - --miner.recommit=${OP_GETH_RECOMMIT:-200ms}
+      - --miner.gaslimit=100000000      # 与 L2_GAS_LIMIT 一致；business 需求 100M block
+      - --miner.gasprice=0              # 让所有 tx 都能进 block（pricelimit 已在 txpool 层做）
+      # === txpool journal 禁用 ===
+      # geth 默认把 mempool 持久化到 transactions.rlp，重启时 reload。
+      # 压测场景下：上次跑爆的几万笔死 tx (nonce 不连续) 会一直留在 queued pool
+      # 永远不出，下次重启又重新载入造成死锁。压测必须关。
+      - --txpool.journal=               # 空字符串 = 禁用 journal
+      - --txpool.nolocals               # 所有 tx 都按 remote 处理（remote tx 默认不 journal）
+      - --metrics
+      - --metrics.addr=0.0.0.0
+      - --metrics.port=6060
+      - --verbosity=3
+    ports:
+      - "${L2_RPC_PORT}:8545"
+      - "${L2_WS_PORT}:8546"
+    volumes:
+      - opgeth-data:/data/geth
+      - ./workdir/shared:/shared:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- --post-data '{\"jsonrpc\":\"2.0\",\"method\":\"eth_blockNumber\",\"params\":[],\"id\":1}' --header 'Content-Type: application/json' http://localhost:8545 | grep -q result"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
+    logging: *default-logging
+    networks: [mychain]
+
+  # ===========================================================================
+  # op-node（L2 共识 / sequencer）
+  # ===========================================================================
+  op-node:
+    image: ${OP_NODE_IMAGE}
+    container_name: mychain-op-node
+    restart: unless-stopped
+    stop_grace_period: 30s
+    entrypoint: ["op-node"]
+    command:
+      - --l1=${L1_RPC_URL_INTERNAL}
+      - --l1.rpckind=standard
+      - --l1.trustrpc=true
+      - --l1.beacon=none
+      - --l1.beacon.ignore=true
+      # === op-node 的 L2 Engine API 指向 ===
+      # v6 默认直接打到 op-geth:8551。
+      # v7 (Flashblocks) 通过 docker-compose.flashblocks.yml override 把这个变量
+      # 改成 http://rollup-boost:8551，让 rollup-boost 做 engine API 的 dispatch
+      # （分发给 op-geth + op-rbuilder）。
+      # 默认值保持 v6 行为，不改 .env 时拉起没有任何影响。
+      - --l2=${OP_NODE_L2_ENGINE_URL:-http://op-geth:8551}
+      - --l2.jwt-secret=/shared/jwt.txt
+      - --rollup.config=/shared/rollup.json
+      - --rollup.l1-chain-config=/shared/l1-chain-config.json
+      - --sequencer.enabled=true
+      - --sequencer.l1-confs=2
+      - --verifier.l1-confs=2
+      - --rpc.addr=0.0.0.0
+      - --rpc.port=8547
+      - --rpc.enable-admin
+      - --p2p.disable
+      - --p2p.sequencer.key=${SEQUENCER_PRIVATE_KEY}
+      - --metrics.enabled=true
+      - --metrics.addr=0.0.0.0
+      - --metrics.port=7300
+      - --log.level=info
+    ports:
+      - "${OP_NODE_RPC_PORT}:8547"
+    volumes:
+      - ./workdir/shared:/shared:ro
+    depends_on:
+      op-geth:
+        condition: service_healthy
+      anvil:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- --post-data '{\"jsonrpc\":\"2.0\",\"method\":\"optimism_syncStatus\",\"params\":[],\"id\":1}' --header 'Content-Type: application/json' http://localhost:8547 | grep -q result"]
+      interval: 15s
+      timeout: 3s
+      retries: 10
+      start_period: 30s
+    logging: *default-logging
+    networks: [mychain]
+
+  # ===========================================================================
+  # op-batcher（提交 batch 到 L1）
+  # ===========================================================================
+  op-batcher:
+    image: ${OP_BATCHER_IMAGE}
+    container_name: mychain-op-batcher
+    restart: unless-stopped
+    entrypoint: ["op-batcher"]
+    command:
+      - --l1-eth-rpc=${L1_RPC_URL_INTERNAL}
+      - --l2-eth-rpc=http://op-geth:8545
+      - --rollup-rpc=http://op-node:8547
+      - --private-key=${BATCHER_PRIVATE_KEY}
+      - --poll-interval=2s
+      - --sub-safety-margin=4
+      - --num-confirmations=1
+      - --safe-abort-nonce-too-low-count=3
+      - --resubmission-timeout=30s
+      - --max-channel-duration=10
+      - --batch-type=1
+      - --data-availability-type=${BATCHER_DA_TYPE}
+      # 注：op-batcher v1.9.5+ 主线引入了 batcher→sequencer throttling
+      # （--throttle-threshold 等），但我们用的 op-batcher v1.16.7 没合入这套
+      # flag（实测 --help | grep -i throttle 为空，op-geth 也没有 miner_setMaxDASize
+      # RPC）。压测瓶颈实际不在这里 —— 详见 docs/STRESS_TEST_REPORT.md 第 6 节。
+      - --rpc.addr=0.0.0.0
+      - --rpc.port=8548
+      - --rpc.enable-admin
+      - --metrics.enabled=true
+      - --metrics.addr=0.0.0.0
+      - --metrics.port=7301
+      - --log.level=info
+    depends_on:
+      op-node:
+        condition: service_healthy
+    logging: *default-logging
+    networks: [mychain]
+
+  # ===========================================================================
+  # op-proposer（提交 output root 到 L1，可选 profile=proposer）
+  #
+  # dev 阶段默认不启动：本地 anvil 没有真实的争议博弈/欺诈证明价值，
+  # proposer 只会徒增配置复杂度（要 game factory 地址、game type）。
+  # 等到 Sepolia/mainnet 阶段再启用：`make proposer-up` 或加 --profile proposer。
+  # ===========================================================================
+  op-proposer:
+    image: ${OP_PROPOSER_IMAGE}
+    container_name: mychain-op-proposer
+    profiles: ["proposer"]
+    restart: unless-stopped
+    entrypoint: ["op-proposer"]
+    command:
+      - --l1-eth-rpc=${L1_RPC_URL_INTERNAL}
+      - --rollup-rpc=http://op-node:8547
+      - --private-key=${PROPOSER_PRIVATE_KEY}
+      - --poll-interval=6s
+      - --num-confirmations=1
+      - --game-factory-address=${DISPUTE_GAME_FACTORY_PROXY:-0x0000000000000000000000000000000000000000}
+      - --proposal-interval=30s
+      - --game-type=1
+      - --rpc.port=8560
+      - --metrics.enabled=true
+      - --metrics.addr=0.0.0.0
+      - --metrics.port=7302
+      - --wait-node-sync=true
+      - --log.level=info
+    depends_on:
+      op-node:
+        condition: service_healthy
+    logging: *default-logging
+    networks: [mychain]
+
+networks:
+  mychain:
+    name: mychain-dev
+
+volumes:
+  anvil-data:
+  opgeth-data:

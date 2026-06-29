@@ -1,0 +1,24 @@
+{
+  "name": "mychain-bundle-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "JSON-RPC adapter: eth_sendRawTransaction → eth_sendBundle (op-rbuilder) with fail-fast and fallback to op-geth",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "test": "node --test test/",
+    "test:smoke": "node test/smoke.test.js",
+    "mock": "node mock-rbuilder/index.js"
+  },
+  "dependencies": {
+    "fastify": "^4.28.1",
+    "prom-client": "^15.1.3",
+    "undici": "^6.19.0",
+    "viem": "^2.21.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -1,0 +1,106 @@
+# =============================================================================
+# MyChain L1 — 独立 geth Clique PoA 链
+# 用法见同目录 README.md
+# =============================================================================
+name: mychain-l1
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "10"
+
+services:
+
+  # ===========================================================================
+  # geth-l1：单 validator Clique PoA L1
+  # ===========================================================================
+  geth-l1:
+    image: ${GETH_IMAGE}
+    container_name: mychain-l1-geth
+    restart: unless-stopped
+    stop_grace_period: 30s
+    entrypoint: ["geth"]
+    command:
+      - --datadir=/data
+      - --networkid=${L1_CHAIN_ID}
+      # === 同步与 GC 模式 ===
+      # 自己就是创世节点，没有 snap source；archive 保留全历史 state
+      # 让 op-deployer / 钱包能查任意历史 block 的 storage（方便排错）
+      - --syncmode=full
+      - --gcmode=archive
+      # === HTTP RPC ===
+      - --http
+      - --http.addr=0.0.0.0
+      - --http.port=8545
+      - --http.corsdomain=*
+      - --http.vhosts=*
+      - --http.api=eth,net,web3,debug,txpool,personal,clique,miner,admin
+      # === WebSocket RPC ===
+      - --ws
+      - --ws.addr=0.0.0.0
+      - --ws.port=8546
+      - --ws.origins=*
+      - --ws.api=eth,net,web3,debug,txpool,clique,admin
+      # === P2P：单节点 dev 链，关掉 discovery，不接外部 peer ===
+      - --nodiscover
+      - --maxpeers=0
+      - --port=30303
+      # === Mining (Clique PoA 单签 validator) ===
+      - --mine
+      - --miner.etherbase=${VALIDATOR_ADDRESS}
+      - --miner.gaslimit=${L1_GAS_LIMIT}
+      - --miner.gasprice=0
+      # validator keystore 在 bind mount /keystore 下，geth 启动时 unlock 它
+      # --allow-insecure-unlock 是为了允许 HTTP 通道里的 personal_* 解锁请求
+      # （dev 链可接受，未来如要对外公开 RPC 务必删除并改用 clef / 离线签名）
+      - --keystore=/keystore
+      - --unlock=${VALIDATOR_ADDRESS}
+      - --password=/secrets/password.txt
+      - --allow-insecure-unlock
+      # === 其他 ===
+      - --cache=4096
+      - --rpc.gascap=50000000
+      # 允许大额转账（dev 测试用，0 = 不限上限）
+      - --rpc.txfeecap=0
+      - --verbosity=3
+    volumes:
+      - geth-l1-data:/data
+      - ./keystore:/keystore:ro
+      - ./secrets/password.txt:/secrets/password.txt:ro
+    # BIND_HOST 控制端口的可达范围：
+    #   - 127.0.0.1 (默认，推荐) ：只 host 本机可访问，配合 nginx 反代走 HTTPS
+    #   - 0.0.0.0              ：直接暴露公网，运维防火墙得另外开 8545/8546
+    ports:
+      - "${BIND_HOST:-127.0.0.1}:${HTTP_PORT:-8545}:8545"
+      - "${BIND_HOST:-127.0.0.1}:${WS_PORT:-8546}:8546"
+      # P2P 我们不出网（nodiscover + maxpeers=0），随便 bind 哪都没用
+      - "127.0.0.1:${P2P_PORT:-30303}:30303/tcp"
+    healthcheck:
+      # geth 官方镜像是 alpine + busybox，没 curl，用 wget
+      test:
+        - CMD-SHELL
+        - |
+          wget -qO- --header='Content-Type:application/json' \
+            --post-data='{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' \
+            http://localhost:8545 | grep -q '"result"' || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    logging: *default-logging
+    networks: [mychain-l1]
+
+# 显式 network，blockscout/docker-compose.yml 用 external 引用同一个
+# `mychain-l1-net`，从而跟 geth 容器 DNS 互通（hostname 直接用 `geth-l1`）。
+networks:
+  mychain-l1:
+    name: mychain-l1-net
+    driver: bridge
+
+volumes:
+  # 显式 name，避免被 docker compose project 前缀污染；
+  # 这样不管 cwd 是 dev/l1 还是别的目录，volume 都是 mychain-l1-geth-data
+  geth-l1-data:
+    name: mychain-l1-geth-data
+    driver: local

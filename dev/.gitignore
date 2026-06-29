@@ -1,0 +1,8 @@
+# dev 环境运行产物，不入仓
+.env
+workdir/
+*.log
+
+# Python bytecode（l1-proxy 用 stdlib，验证语法时会生成）
+__pycache__/
+*.pyc

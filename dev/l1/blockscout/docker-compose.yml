@@ -1,0 +1,198 @@
+# =============================================================================
+# Blockscout for MyChain L1（standard Ethereum flavor，非 Optimism）
+#
+# 7 个 service：
+#   db                        PostgreSQL 16，indexer 主库
+#   redis                     缓存 / 实时事件总线
+#   backend                   blockscout/blockscout:latest（不要 -optimism）
+#   frontend                  Next.js Web UI
+#   smart-contract-verifier   合约 verify 服务（dev 部署合约时常用）
+#   stats-db                  独立 PostgreSQL，给 stats 微服务用
+#   stats                     首页 Daily transactions tile + Charts 数据源
+#
+# 跟 ../docker-compose.yml (geth-l1) 通过 external network `mychain-l1-net`
+# 互通（geth 容器 hostname = `geth-l1`）。
+#
+# 启动：cd dev/l1 && make blockscout-up
+# 停止：cd dev/l1 && make blockscout-down
+# =============================================================================
+name: mychain-l1-blockscout
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+services:
+
+  db:
+    image: postgres:16-alpine
+    container_name: mychain-l1-bs-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: blockscout
+      POSTGRES_USER: blockscout
+      POSTGRES_PASSWORD: blockscout
+    volumes:
+      - l1-bs-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U blockscout"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    logging: *default-logging
+    networks: [mychain-l1]
+
+  redis:
+    image: redis:7-alpine
+    container_name: mychain-l1-bs-redis
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    volumes:
+      - l1-bs-redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    logging: *default-logging
+    networks: [mychain-l1]
+
+  backend:
+    image: ${BS_BACKEND_IMAGE}
+    container_name: mychain-l1-bs-backend
+    restart: unless-stopped
+    # 经验值：BEAM 经常吃 SIGTERM 不退，30s 已是 dev 合理上限
+    stop_grace_period: 30s
+    stop_signal: SIGTERM
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command:
+      - sh
+      - -c
+      - 'bin/blockscout eval "Elixir.Explorer.ReleaseTasks.create_and_migrate()" && bin/blockscout start'
+    env_file:
+      - ./envs/backend.env
+    ports:
+      - "${BIND_HOST:-127.0.0.1}:${BS_API_PORT:-4001}:4000"
+    healthcheck:
+      # 127.0.0.1 不要 localhost（BusyBox 可能解析成 IPv6，Cowboy 只 bind v4）
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:4000/api/v2/blocks?limit=1 2>/dev/null | grep -q '\"items\"' || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 30
+      start_period: 120s
+    logging: *default-logging
+    networks: [mychain-l1]
+
+  smart-contract-verifier:
+    image: ${BS_VERIFIER_IMAGE}
+    container_name: mychain-l1-bs-verifier
+    restart: unless-stopped
+    environment:
+      SMART_CONTRACT_VERIFIER__SERVER__HTTP__ADDR: 0.0.0.0:8050
+      SMART_CONTRACT_VERIFIER__SERVER__GRPC__ENABLED: "false"
+    logging: *default-logging
+    networks: [mychain-l1]
+
+  stats-db:
+    image: postgres:16-alpine
+    container_name: mychain-l1-bs-stats-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: stats
+      POSTGRES_USER: stats
+      POSTGRES_PASSWORD: stats
+    volumes:
+      - l1-bs-stats-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stats"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    logging: *default-logging
+    networks: [mychain-l1]
+
+  stats:
+    image: ${BS_STATS_IMAGE}
+    container_name: mychain-l1-bs-stats
+    restart: unless-stopped
+    depends_on:
+      stats-db:
+        condition: service_healthy
+      backend:
+        condition: service_started
+    environment:
+      STATS__RUN_MIGRATIONS: "true"
+      STATS__CREATE_DATABASE: "true"
+      STATS__SERVER__HTTP__ADDR: 0.0.0.0:8050
+      STATS__SERVER__HTTP__ENABLED: "true"
+      STATS__SERVER__GRPC__ENABLED: "false"
+      STATS__DB_URL: postgres://stats:stats@stats-db:5432/stats
+      STATS__BLOCKSCOUT_DB_URL: postgres://blockscout:blockscout@db:5432/blockscout
+      STATS__BLOCKSCOUT_API_URL: http://backend:4000
+      # 注：blockscout/stats:latest 近期 schema 变更：
+      #   - 删了 STATS__CHAIN__ID（chain id 现在从 backend API 自动拉）
+      #   - STATS__CONDITIONAL_START__BLOCKS_RATIO 从 number 改成
+      #     ToggleableThreshold 结构体，配错就 crash
+      # 这俩字段都用默认值即可，不再 override
+      STATS__SERVER__HTTP__CORS__ENABLED: "true"
+      STATS__SERVER__HTTP__CORS__ALLOWED_ORIGIN: "*"
+    ports:
+      - "${BIND_HOST:-127.0.0.1}:${BS_STATS_PORT:-8081}:8050"
+    logging: *default-logging
+    networks: [mychain-l1]
+
+  frontend:
+    image: ${BS_FRONTEND_IMAGE}
+    container_name: mychain-l1-bs-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    env_file:
+      - ./envs/frontend.env
+    ports:
+      - "${BIND_HOST:-127.0.0.1}:${BS_PORT:-3001}:3000"
+    volumes:
+      # 链 logo / icon（Blockscout v9 frontend 这套挂法详见 dev/blockscout/docker-compose.yml）
+      - ./assets:/app/public/assets/network:ro
+      - ./assets/logo.svg:/app/public/assets/configs/network_logo.svg:ro
+      - ./assets/logo.svg:/app/public/assets/configs/network_logo_dark.svg:ro
+      - ./assets/icon.svg:/app/public/assets/configs/network_icon.svg:ro
+      - ./assets/icon.svg:/app/public/assets/configs/network_icon_dark.svg:ro
+      # 预生成的 favicon 套件（由 dev/l1/scripts/blockscout-make-favicon.sh 在
+      # blockscout-up 时自动生成）。
+      # 关键：Blockscout v9 frontend 的 HTML <head> 把 favicon 引到
+      # /assets/favicon/favicon.ico 而不是根 /favicon.ico（curl frontend:3000 实测）。
+      # 镜像自带 /app/public/assets/favicon/ 一套默认 favicon，必须 mount 覆盖才生效。
+      - ./assets/favicon/favicon.ico:/app/public/assets/favicon/favicon.ico:ro
+      - ./assets/favicon/favicon-16x16.png:/app/public/assets/favicon/favicon-16x16.png:ro
+      - ./assets/favicon/favicon-32x32.png:/app/public/assets/favicon/favicon-32x32.png:ro
+      - ./assets/favicon/favicon-48x48.png:/app/public/assets/favicon/favicon-48x48.png:ro
+      - ./assets/favicon/favicon-96x96.png:/app/public/assets/favicon/favicon-96x96.png:ro
+      - ./assets/favicon/apple-touch-icon-180x180.png:/app/public/assets/favicon/apple-touch-icon-180x180.png:ro
+      - ./assets/favicon/android-chrome-192x192.png:/app/public/assets/favicon/android-chrome-192x192.png:ro
+      - ./assets/favicon/android-chrome-512x512.png:/app/public/assets/favicon/android-chrome-512x512.png:ro
+      # 根目录兜底（少数老浏览器直接 GET /favicon.ico）
+      - ./assets/favicon/favicon.ico:/app/public/favicon.ico:ro
+    logging: *default-logging
+    networks: [mychain-l1]
+
+# external 网络 = 由 ../docker-compose.yml 创建并管理
+# 这样：blockscout 容器可以用 hostname `geth-l1` 直接 RPC 到 L1
+networks:
+  mychain-l1:
+    name: mychain-l1-net
+    external: true
+
+volumes:
+  l1-bs-db:
+    name: mychain-l1-bs-db
+  l1-bs-redis:
+    name: mychain-l1-bs-redis
+  l1-bs-stats-db:
+    name: mychain-l1-bs-stats-db

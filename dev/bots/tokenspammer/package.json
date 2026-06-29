@@ -1,0 +1,23 @@
+{
+  "name": "man-tokenspammer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "ERC-20 multi-token stress test bot — deploy 1000 tokens, 50000 wallets, 1000 TPS random transfers",
+  "scripts": {
+    "init": "node tokenspammer.js init",
+    "mint": "node tokenspammer.js mint",
+    "deploy": "node tokenspammer.js deploy",
+    "fund-gas": "node tokenspammer.js fund-gas",
+    "seed": "node tokenspammer.js seed",
+    "spam": "node tokenspammer.js spam",
+    "status": "node tokenspammer.js status"
+  },
+  "dependencies": {
+    "viem": "^2.21.0",
+    "undici": "^6.19.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

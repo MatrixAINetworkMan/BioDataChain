@@ -1,0 +1,9 @@
+node_modules
+test
+mock-rbuilder
+*.log
+.env
+.env.*
+.git
+.gitignore
+README.md

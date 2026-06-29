@@ -1,0 +1,229 @@
+# =============================================================================
+# Flashblocks override (mychain v7) — 在 docker-compose.yml 之上叠加 4 个容器
+#
+# 用法：
+#   docker compose \
+#     --env-file .env --env-file .env.flashblocks \
+#     -f docker-compose.yml -f docker-compose.flashblocks.yml \
+#     up -d
+#
+# 或用 make 包装：make flashblocks-up / make dev-up-flashblocks
+#
+# 拓扑变化（相对 v6）：
+#   [op-node] --(engine API :8081)--> [rollup-boost] --dispatch--> [op-geth :8551]
+#                                                                 [op-rbuilder :9551]
+#                                                                       │
+#                                                                       │ sub-flashblock stream (WS :1111)
+#                                                                       ▼
+#                                                                [flashblocks-rpc :8545]
+#
+#   [dApp / SDK] --eth_sendRawTransaction--> [bundle-proxy :9560]
+#                                                  │ eth_sendBundle
+#                                                  ▼
+#                                            [op-rbuilder :8545]
+#
+# 关键端口（容器内 / host 暴露）：
+#   - rollup-boost RPC = 8081 / 9555  ← engine API 入口（op-node 连这里）
+#   - op-rbuilder HTTP RPC = 8545 / 9550
+#   - op-rbuilder Engine API = 9551 (上游的 --authrpc.port) / 不暴露
+#   - op-rbuilder Flashblocks WS = 1111 / 不暴露
+#   - flashblocks-rpc = 8545 / 9548
+#   - bundle-proxy = 9560 + 9561 (metrics)
+#
+# 关键约束（在 docs/PHASE2_INTEGRATION.md 已记录）：
+#   - chainId 在 .env.flashblocks 覆盖为 175700
+#   - OP_NODE_L2_ENGINE_URL=http://rollup-boost:8081 让 op-node 走 boost
+#     （注意：rollup-boost --rpc-port 默认 8081，不是 op-geth 那个 8551！）
+#   - op-batcher 仍指 op-geth:8545（拉 finalized state，不走 pre-confirmation）
+#   - 4 个新容器的 image tag、命令行参数请在 .env.flashblocks 里调整
+#     （flashbots/op-rbuilder + rollup-boost + flashblocks-rpc 版本变化频繁，
+#      硬编码会让升级链 image 时炸 git diff，参数化最稳）
+# =============================================================================
+
+services:
+
+  # ===========================================================================
+  # op-rbuilder：外部 builder，吃 eth_sendBundle，输出 sub-flashblock（每 250ms）
+  # 基于 reth fork，参数风格跟 reth 一致（不是 geth）。
+  # ===========================================================================
+  op-rbuilder:
+    image: ${OP_RBUILDER_IMAGE}
+    container_name: mychain-op-rbuilder
+    restart: unless-stopped
+    stop_grace_period: 30s
+    # entrypoint = /app/rbuilder（见 op-rbuilder Dockerfile main 分支）。
+    # 默认参数来自 op-rbuilder README v0.3.x 实测，只保留必需 + flashblocks 开关：
+    #   - node                              : reth fork 的 subcommand
+    #   - --chain=/shared/genesis.json      : op-deployer 生成
+    #   - --datadir=/data/rbuilder
+    #   - --http --http.addr=0.0.0.0 --http.port=8545  : HTTP RPC（bundle-proxy 走这）
+    #   - --authrpc.* port=9551             : engine API（rollup-boost 走这）
+    #   - --flashblocks.port=1111 --flashblocks.addr=0.0.0.0 : sub-flashblock WS
+    #   - --metrics=0.0.0.0:6061
+    #
+    # ⚠️ 不再用 `--rollup.sequencer-http` / `--rollup.disable-tx-pool-gossip`：
+    #    这两个 reth 老参数在 op-rbuilder 0.3.x 已重命名 / 移除，硬给会让进程 panic。
+    #    版本兼容问题统一通过 .env.flashblocks 的 OP_RBUILDER_ARGS 覆盖。
+    #
+    # v7.1 必加参数（chain-test-2 实测得出）：
+    #   - --http.api=...,txpool   暴露 txpool_status RPC，方便容量监控
+    #   - --txpool.pending-max-count=20000  / --txpool.queued-max-count=4000
+    #   - --txpool.pending-max-size=200 (MB) / --txpool.queued-max-size=80 (MB)
+    #   reth 默认 pending-max-count=10000，800 TPS 时 deploy/fund-gas 阶段瞬时打满
+    #   导致 "txpool is full" 大量 reject；放大到 20000 后实测 800 TPS × 5min 0 fail。
+    command: ${OP_RBUILDER_ARGS:-node --chain=/shared/genesis.json --datadir=/data/rbuilder --http --http.addr=0.0.0.0 --http.port=8545 --http.corsdomain=* --http.api=eth,web3,net,debug,txpool --authrpc.addr=0.0.0.0 --authrpc.port=9551 --authrpc.jwtsecret=/shared/jwt.txt --flashblocks.port=1111 --flashblocks.addr=0.0.0.0 --port=30303 --discovery.port=30303 --metrics=0.0.0.0:6061 --txpool.pending-max-count=20000 --txpool.queued-max-count=4000 --txpool.pending-max-size=200 --txpool.queued-max-size=80}
+    ports:
+      - "${OP_RBUILDER_PORT:-9550}:8545"
+      - "${OP_RBUILDER_FB_WS_PORT:-9551}:1111"
+    volumes:
+      - rbuilder-data:/data/rbuilder
+      - ./workdir/shared:/shared:ro
+    depends_on:
+      op-geth:
+        condition: service_healthy
+    # op-rbuilder runtime image 是 distroless/cc-debian12，容器内**没有 shell 也没有
+    # wget/curl**，CMD-SHELL healthcheck 永远 fail → docker 报 unhealthy（实际进程
+    # 是健康的）。这里禁掉 docker 内部 healthcheck，由 host 端 smoke 脚本探活。
+    healthcheck:
+      disable: true
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    networks: [mychain]
+
+  # ===========================================================================
+  # rollup-boost：engine API dispatcher，op-node 跟这个对话，它转发到 builder + geth
+  # ===========================================================================
+  rollup-boost:
+    image: ${ROLLUP_BOOST_IMAGE}
+    container_name: mychain-rollup-boost
+    restart: unless-stopped
+    stop_grace_period: 30s
+    # 参数同样版本敏感。.env.flashblocks 里给 ROLLUP_BOOST_ARGS 覆盖。
+    # 默认值来自 flashbots/rollup-boost main README（2026-05 实测）：
+    #   - 没有 `server` 子命令（直接 args）
+    #   - --rpc-port 默认 8081（这是 op-node engine API 端口！不是 8551）
+    #   - --debug-host=0.0.0.0 暴露 debug API（debug_setExecutionMode 用）
+    #   - --metrics 开 metrics（默认 metrics-host 127.0.0.1，容器内要 0.0.0.0）
+    #   - 没有 --boost-sync / --execution-mode CLI flag（这些是通过 debug RPC 设置的）
+    command: ${ROLLUP_BOOST_ARGS:---rpc-host=0.0.0.0 --rpc-port=8081 --l2-jwt-path=/shared/jwt.txt --l2-url=http://op-geth:8551 --builder-jwt-path=/shared/jwt.txt --builder-url=http://op-rbuilder:9551 --debug-host=0.0.0.0 --debug-server-port=5555 --metrics --metrics-host=0.0.0.0 --log-level=info}
+    volumes:
+      - ./workdir/shared:/shared:ro
+    ports:
+      - "${ROLLUP_BOOST_PORT:-9555}:8081"
+    depends_on:
+      op-rbuilder:
+        condition: service_started
+      op-geth:
+        condition: service_healthy
+    # rollup-boost 也是 distroless（debian-slim 实测无 wget），同 op-rbuilder 关闭。
+    # 真实健康用 host 端 _wait-rollup-boost target 或 flashblocks-smoke 探活。
+    healthcheck:
+      disable: true
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    networks: [mychain]
+
+  # ===========================================================================
+  # flashblocks-rpc：read replica，订阅 op-rbuilder 的 sub-flashblock stream
+  # （pre-confirmation 视图）。
+  #
+  # ⚠️ 现状（2026-05 实测）：
+  #   - flashbots/flashblocks-rpc 独立 image 已 10 个月没更新（sha-7caffb9 是最后版本）
+  #   - 新版 op-rbuilder 0.3.x 的 sub-flashblock 协议跟老版 flashblocks-rpc 不兼容
+  #   - 替代方案是 base/node-reth（reth fork，通过 RETH_FB_WEBSOCKET_URL 启用 fb 模式）
+  #
+  # 因此本容器默认放在 `flashblocks-rpc` profile 下，不参与默认启动。
+  # 想试老版本：docker compose --profile flashblocks-rpc up
+  # v7.1 计划：替换成 base/node-reth 风格的 reth fork（独立 PR）
+  # ===========================================================================
+  flashblocks-rpc:
+    profiles: ["flashblocks-rpc"]
+    image: ${FLASHBLOCKS_RPC_IMAGE}
+    container_name: mychain-flashblocks-rpc
+    restart: unless-stopped
+    stop_grace_period: 30s
+    # ⚠️ 这些参数针对 10 个月前的老 image。新版协议变了肯定跑不起来，
+    # 真要用建议研究 base/node-reth 文档自己定参数后通过 .env.flashblocks 覆盖。
+    command: ${FLASHBLOCKS_RPC_ARGS:---rpc-host=0.0.0.0 --rpc-port=8545 --builder-ws-url=ws://op-rbuilder:1111 --opgeth-rpc-url=http://op-geth:8545 --chain-id=${L2_CHAIN_ID}}
+    ports:
+      - "${FLASHBLOCKS_RPC_PORT:-9548}:8545"
+    depends_on:
+      op-rbuilder:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- --post-data '{\"jsonrpc\":\"2.0\",\"method\":\"eth_chainId\",\"params\":[],\"id\":1}' --header 'Content-Type: application/json' http://localhost:8545 | grep -q result || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    networks: [mychain]
+
+  # ===========================================================================
+  # bundle-proxy：dApp 唯一入口
+  #   - eth_sendRawTransaction → eth_sendBundle (op-rbuilder)
+  #   - 读路径默认走 op-geth（finalized 稳）；想试 flashblocks-rpc 把
+  #     BUNDLE_PROXY_READ_TARGET=flashblocks 并 docker compose --profile flashblocks-rpc
+  #   - fail-fast：in-flight 上限 1000，超即返 -32000
+  #   - 熔断 fallback：rbuilder 连续 5 次失败 → 走 op-geth eth_sendRawTransaction
+  # ===========================================================================
+  bundle-proxy:
+    build:
+      context: ./bundle-proxy
+      dockerfile: Dockerfile
+    image: mychain/bundle-proxy:0.1.0
+    container_name: mychain-bundle-proxy
+    restart: unless-stopped
+    stop_grace_period: 30s
+    environment:
+      PORT: "9560"
+      METRICS_PORT: "9561"
+      HOST: "0.0.0.0"
+      LOG_LEVEL: ${BUNDLE_PROXY_LOG_LEVEL:-info}
+      RBUILDER_URL: ${BUNDLE_PROXY_RBUILDER_URL:-http://op-rbuilder:8545}
+      OPGETH_URL: ${BUNDLE_PROXY_OPGETH_URL:-http://op-geth:8545}
+      FLASHBLOCKS_RPC_URL: ${BUNDLE_PROXY_FLASHBLOCKS_URL:-http://flashblocks-rpc:8545}
+      READ_TARGET: ${BUNDLE_PROXY_READ_TARGET:-opgeth}
+      IN_FLIGHT_LIMIT: ${BUNDLE_PROXY_IN_FLIGHT_LIMIT:-1000}
+      BUNDLE_BLOCK_OFS: ${BUNDLE_PROXY_BLOCK_OFS:-10}
+      HTTP_POOL_SIZE: ${BUNDLE_PROXY_POOL_SIZE:-32}
+      HTTP_PIPELINE: ${BUNDLE_PROXY_PIPELINE:-10}
+      HTTP_TIMEOUT_MS: ${BUNDLE_PROXY_TIMEOUT_MS:-5000}
+      ENABLE_FALLBACK: ${BUNDLE_PROXY_FALLBACK:-true}
+      FALLBACK_THRESHOLD: ${BUNDLE_PROXY_FALLBACK_THRESHOLD:-5}
+      FALLBACK_HALF_OPEN_MS: ${BUNDLE_PROXY_FALLBACK_HALF_OPEN_MS:-5000}
+      CHAIN_ID: ${L2_CHAIN_ID}
+    ports:
+      - "${BUNDLE_PROXY_PORT:-9560}:9560"
+      - "${BUNDLE_PROXY_METRICS_PORT:-9561}:9561"
+    depends_on:
+      op-rbuilder:
+        condition: service_started
+      op-geth:
+        condition: service_healthy
+    # bundle-proxy 是 node:20-alpine（有 wget），健康 check 用自己的 /healthz
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9560/healthz | grep -q '\"status\":\"ok\"' || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    networks: [mychain]
+
+volumes:
+  rbuilder-data:

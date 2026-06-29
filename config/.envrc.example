@@ -1,0 +1,71 @@
+##############################################################################
+# MyChain L2 - Environment Variables
+# Copy this file to .envrc and fill in the values, then run `direnv allow`
+##############################################################################
+
+# --- L1 Network (BSC) ---
+# For BSC Testnet: https://data-seed-prebsc-1-s1.bnbchain.org:8545
+# For BSC Mainnet: use your own BSC full node or a trusted RPC provider
+export L1_RPC_URL="https://data-seed-prebsc-1-s1.bnbchain.org:8545"
+export L1_RPC_KIND="standard"
+export L1_CHAIN_ID=97
+export L1_BLOCK_TIME=3
+
+# --- L2 Chain ---
+export L2_CHAIN_ID=42170
+export L2_BLOCK_TIME=3
+
+# --- Deployment Context ---
+export DEPLOYMENT_CONTEXT="mychain"
+export IMPL_SALT=$(openssl rand -hex 32)
+
+# --- Admin Account (use multisig in production!) ---
+export GS_ADMIN_ADDRESS=
+export GS_ADMIN_PRIVATE_KEY=
+
+# --- Batcher Account ---
+export GS_BATCHER_ADDRESS=
+export GS_BATCHER_PRIVATE_KEY=
+
+# --- Proposer Account ---
+export GS_PROPOSER_ADDRESS=
+export GS_PROPOSER_PRIVATE_KEY=
+
+# --- Sequencer Account ---
+export GS_SEQUENCER_ADDRESS=
+export GS_SEQUENCER_PRIVATE_KEY=
+
+# --- Custom Gas Token ---
+# Address of the ERC-20 token deployed on L1 (BSC) to use as native gas token
+export CUSTOM_GAS_TOKEN_ADDRESS=
+# Initial holder of minted tokens
+export TOKEN_INITIAL_HOLDER=$GS_ADMIN_ADDRESS
+# Total supply (in wei) - default 2B tokens (2,000,000,000)
+export TOKEN_INITIAL_SUPPLY=2000000000000000000000000000
+
+# --- Contract Deployment Paths ---
+export DEPLOY_CONFIG_PATH="./config/deploy-config.json"
+export DEPLOYMENT_OUTFILE="./deployments/L1/.deploy"
+export STATE_DUMP_PATH="./config/state.json"
+
+# --- BSCScan (for contract verification) ---
+export BSCSCAN_API_KEY=
+export BSC_MAINNET_RPC_URL=$L1_RPC_URL
+export BSC_TESTNET_RPC_URL=$L1_RPC_URL
+
+# --- op-geth ---
+export OPGETH_DATA_DIR="./data/opgeth"
+export OPGETH_HTTP_PORT=8545
+export OPGETH_WS_PORT=8546
+export OPGETH_AUTH_PORT=8551
+export OPGETH_METRICS_PORT=6060
+
+# --- op-node ---
+export OPNODE_RPC_PORT=8547
+export OPNODE_METRICS_PORT=7070
+
+# --- op-batcher ---
+export OPBATCHER_RPC_PORT=8548
+
+# --- op-proposer ---
+export OPPROPOSER_RPC_PORT=8560

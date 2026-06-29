@@ -1,0 +1,240 @@
+# =============================================================================
+# Blockscout 完整版（Optimism flavor）— MAN L2 dev 环境
+#
+# 8 个服务：
+#   db                  PostgreSQL 16，主索引数据库
+#   redis               缓存 / 实时事件总线
+#   backend             Elixir 索引器 + REST/GraphQL API（blockscout-optimism 镜像）
+#   frontend            Next.js Web UI
+#   smart-contract-verifier  Rust 编译验证服务
+#   sig-provider        Rust 函数签名解码服务
+#   stats-db            独立 PostgreSQL，给 stats 微服务存聚合
+#   stats               Rust stats 微服务（首页 Daily transactions tile + 各种图表）
+#
+# 这套 stack 独立于主链 dev/docker-compose.yml，但通过外部网络 mychain-dev
+# 跟 op-geth / anvil 通讯。这样 `make blockscout-down` 不会再误伤主链。
+#
+# 拉起：dev/scripts/blockscout-up.sh （Makefile：make blockscout-up）
+# 拆掉：dev/scripts/blockscout-down.sh
+# =============================================================================
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+services:
+
+  db:
+    image: postgres:16-alpine
+    container_name: mychain-blockscout-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: blockscout
+      POSTGRES_USER: blockscout
+      POSTGRES_PASSWORD: blockscout
+    volumes:
+      - bs-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U blockscout"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    logging: *default-logging
+    networks: [mychain]
+
+  redis:
+    image: redis:7-alpine
+    container_name: mychain-blockscout-redis
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    volumes:
+      - bs-redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    logging: *default-logging
+    networks: [mychain]
+
+  backend:
+    image: ${BLOCKSCOUT_BACKEND_IMAGE}
+    container_name: mychain-blockscout-backend
+    restart: unless-stopped
+    # Erlang BEAM 经常吃了 SIGTERM 不退出 → docker compose 会傻等满这个时间再 SIGKILL。
+    # dev 环境不在乎 graceful shutdown（DB 写半截大不了重新索引），30s 足够；
+    # prod 想让 indexer 优雅落盘可以调到 60-120s，但别再用 5m，那就是死等。
+    stop_grace_period: 30s
+    stop_signal: SIGTERM
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command:
+      - sh
+      - -c
+      - 'bin/blockscout eval "Elixir.Explorer.ReleaseTasks.create_and_migrate()" && bin/blockscout start'
+    env_file:
+      - ./envs/backend.env
+    ports:
+      - "${BLOCKSCOUT_API_PORT}:4000"
+    healthcheck:
+      # /api/v2/health 在 Blockscout 9.x 被通配路由抢了；用 /api/v2/blocks 当探测，
+      # 200 + 含 "items" 就视为活着（已经 indexed 至少 1 个块）
+      #
+      # 用 127.0.0.1 不要用 localhost：BusyBox wget 在某些镜像里把 localhost 解析成
+      # ::1 (IPv6)，但 Cowboy 默认只 bind {0,0,0,0} (IPv4) → 永远 Connection refused。
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:4000/api/v2/blocks?limit=1 2>/dev/null | grep -q '\"items\"' || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 30
+      start_period: 120s
+    logging: *default-logging
+    networks: [mychain]
+
+  smart-contract-verifier:
+    image: ${BLOCKSCOUT_VERIFIER_IMAGE}
+    container_name: mychain-blockscout-verifier
+    restart: unless-stopped
+    environment:
+      SMART_CONTRACT_VERIFIER__SERVER__HTTP__ADDR: 0.0.0.0:8050
+      SMART_CONTRACT_VERIFIER__SERVER__GRPC__ENABLED: "false"
+    logging: *default-logging
+    networks: [mychain]
+
+  sig-provider:
+    image: ${BLOCKSCOUT_SIG_PROVIDER_IMAGE}
+    container_name: mychain-blockscout-sig-provider
+    restart: unless-stopped
+    environment:
+      SIG_PROVIDER__SERVER__HTTP__ADDR: 0.0.0.0:8043
+    logging: *default-logging
+    networks: [mychain]
+
+  # ---------------------------------------------------------------------------
+  # stats 微服务专用 PostgreSQL
+  # 跟 backend 主 DB 分开是 Blockscout 官方推荐做法：stats 会自己跑迁移、自己
+  # 建索引/物化视图，混进主 DB 容易跟 backend 的 Ecto 迁移撞表名。
+  # ---------------------------------------------------------------------------
+  stats-db:
+    image: postgres:16-alpine
+    container_name: mychain-blockscout-stats-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: stats
+      POSTGRES_USER: stats
+      POSTGRES_PASSWORD: stats
+    volumes:
+      - bs-stats-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stats"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    logging: *default-logging
+    networks: [mychain]
+
+  # ---------------------------------------------------------------------------
+  # stats 微服务（Rust）—— 首页 "Daily transactions" tile + Charts 页面所有图
+  # 它干的事：定时（默认 1h）从 backend 主 DB 跑聚合 SQL，结果写自己的 stats-db，
+  # frontend 直接从 stats 读时间序列数据。
+  # 没有这服务首页就一直 "Daily transactions: 0"。
+  # ---------------------------------------------------------------------------
+  stats:
+    image: ${BLOCKSCOUT_STATS_IMAGE}
+    container_name: mychain-blockscout-stats
+    restart: unless-stopped
+    depends_on:
+      stats-db:
+        condition: service_healthy
+      # 故意用 service_started 不是 service_healthy：stats 有内置 retry，backend
+      # 没起就一直回退；backend healthcheck 在 dev 环境偶尔会卡很久，没必要把
+      # stats 的启动也阻塞死。
+      backend:
+        condition: service_started
+    environment:
+      # 启动时自动建 stats DB schema + 跑迁移，dev 不用手工 migrate
+      STATS__RUN_MIGRATIONS: "true"
+      STATS__CREATE_DATABASE: "true"
+      STATS__SERVER__HTTP__ADDR: 0.0.0.0:8050
+      STATS__SERVER__HTTP__ENABLED: "true"
+      STATS__SERVER__GRPC__ENABLED: "false"
+      # 自己的 DB
+      STATS__DB_URL: postgres://stats:stats@stats-db:5432/stats
+      # 读 backend 主 DB（只读聚合）
+      STATS__BLOCKSCOUT_DB_URL: postgres://blockscout:blockscout@db:5432/blockscout
+      # 反查链元信息走 backend HTTP API
+      STATS__BLOCKSCOUT_API_URL: http://backend:4000
+      # 启用 OP Stack 专用图表（新版 stats，2026-05 schema：不再用 chain.id，
+      # 直接 flag enable_all_op_stack；老的 STATS__CHAIN__ID / STATS__CONDITIONAL_START__BLOCKS_RATIO
+      # 在 latest 镜像里 schema 不兼容，会 panic 启动失败）
+      STATS__ENABLE_ALL_OP_STACK: "true"
+      # CORS：浏览器从 frontend 域名直接 fetch stats，必须开
+      STATS__SERVER__HTTP__CORS__ENABLED: "true"
+      STATS__SERVER__HTTP__CORS__ALLOWED_ORIGIN: "*"
+    ports:
+      - "${BLOCKSCOUT_STATS_PORT}:8050"
+    logging: *default-logging
+    networks: [mychain]
+
+  frontend:
+    image: ${BLOCKSCOUT_FRONTEND_IMAGE}
+    container_name: mychain-blockscout-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    env_file:
+      - ./envs/frontend.env
+    ports:
+      - "${BLOCKSCOUT_PORT}:3000"
+    # 把本地 assets/ 目录挂进 Next.js 的 public/ 下：
+    #   1) /assets/network/  仅做调试用（直接 GET 原始 svg）
+    #   2) /assets/configs/network_{logo,icon}{,_dark}.svg  ← React 真正读的路径
+    #
+    # Blockscout v9 frontend 的 React 代码会把 NEXT_PUBLIC_NETWORK_LOGO 这种 URL
+    # 改写成 /assets/configs/network_logo.<ext>（参见容器内 /app/feature-reporter.js
+    # 的 buildExternalAssetFilePath()），然后 entrypoint 启动时 download_assets.sh
+    # 会去公网回源下载到这个本地路径。我们这套架构里 entrypoint 跑时 frontend 还
+    # 没绑端口，自己 fetch 自己 ECONNREFUSED → 文件下载失败 → React 退回默认 logo。
+    # 解决方案：把 4 个目标文件直接 volume 挂死，下载失败也无所谓，文件已就位。
+    volumes:
+      - ./assets:/app/public/assets/network:ro
+      - ./assets/logo.svg:/app/public/assets/configs/network_logo.svg:ro
+      - ./assets/logo.svg:/app/public/assets/configs/network_logo_dark.svg:ro
+      - ./assets/icon.svg:/app/public/assets/configs/network_icon.svg:ro
+      - ./assets/icon.svg:/app/public/assets/configs/network_icon_dark.svg:ro
+      # 预生成的 favicon 套件（由 dev/scripts/blockscout-make-favicon.sh 在
+      # blockscout-up 时自动生成）。
+      #
+      # 关键：Blockscout v9 frontend 的 HTML <head> 把 favicon 引到
+      # /assets/favicon/favicon.ico 而不是根目录的 /favicon.ico
+      # （curl frontend:3000 抓 HTML 实测，2026-05-14）。镜像里
+      # /app/public/assets/favicon/ 自带一套默认 favicon，必须 mount 覆盖才生效。
+      # 1) HTML 实际引用路径 /assets/favicon/...（主路径，必须有）
+      - ./assets/favicon/favicon.ico:/app/public/assets/favicon/favicon.ico:ro
+      - ./assets/favicon/favicon-16x16.png:/app/public/assets/favicon/favicon-16x16.png:ro
+      - ./assets/favicon/favicon-32x32.png:/app/public/assets/favicon/favicon-32x32.png:ro
+      - ./assets/favicon/favicon-48x48.png:/app/public/assets/favicon/favicon-48x48.png:ro
+      - ./assets/favicon/favicon-96x96.png:/app/public/assets/favicon/favicon-96x96.png:ro
+      - ./assets/favicon/apple-touch-icon-180x180.png:/app/public/assets/favicon/apple-touch-icon-180x180.png:ro
+      - ./assets/favicon/android-chrome-192x192.png:/app/public/assets/favicon/android-chrome-192x192.png:ro
+      - ./assets/favicon/android-chrome-512x512.png:/app/public/assets/favicon/android-chrome-512x512.png:ro
+      # 2) 根目录兜底（少数老浏览器直接 GET /favicon.ico）
+      - ./assets/favicon/favicon.ico:/app/public/favicon.ico:ro
+    logging: *default-logging
+    networks: [mychain]
+
+# 注意：这里 mychain 是外部网络，由主 docker-compose.yml 创建
+# 如果主链没起来，blockscout-up.sh 会先报错退出
+networks:
+  mychain:
+    name: mychain-dev
+    external: true
+
+volumes:
+  bs-db:
+  bs-redis:
+  bs-stats-db:

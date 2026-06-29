@@ -1,0 +1,6 @@
+node_modules/
+package-lock.json
+wallets-50k.json
+tokens.json
+contracts/out/
+contracts/cache/
