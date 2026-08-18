@@ -1,4 +1,4 @@
-{
+export default {
   "name": "Matrix AI Network",
   "chain": "MATRIX",
   "rpc": [
