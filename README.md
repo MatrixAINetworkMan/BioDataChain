@@ -1,6 +1,6 @@
 # MAN L2
 
-A production-ready BSC Layer 2 chain built on the OP Stack (opBNB), featuring a **custom ERC-20 token (MAN) as the native gas token**.
+A production-ready Layer 1 blockchain independently built and operated by MATRIX, featuring MAN as its native gas token.
 
 ## Quick Start
 
