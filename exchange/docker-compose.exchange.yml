@@ -1,0 +1,168 @@
+# =============================================================================
+# 交易所自建节点（自包含单文件，独立于 layer2/ 可单独交付）
+#
+# 用法：
+#   1. 解压部署包，含本文件 + .env.example + workdir/shared/ + l1-proxy/
+#      （workdir/shared/ 由项目方提供：genesis.json / rollup.json / l1-chain-config.json / jwt.txt）
+#   2. cp .env.example .env && vim .env   # 填 L1_PROXY_UPSTREAM / L2_SEQUENCER_ENODE
+#   3. docker compose -f docker-compose.exchange.yml up -d   # 一个命令起全栈
+#
+# 角色：verifier（只验证不出块）
+#   读：本地 op-geth :9545 / op-node :9547，不经过第三方
+#   写：eth_sendRawTransaction 经 --rollup.sequencerhttp 转发到项目方提供的端点
+#
+# 关键点：op-geth 加了 --rollup.sequencerhttp（本文件核心），
+#         否则非 sequencer 节点发交易会"假成功"（返回 txhash 但永远不上链）。
+# =============================================================================
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "5"
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # L1 JSON-RPC proxy：拦截 eth_blobBaseFee（Clique L1 无 Cancun），其余透传
+  # ---------------------------------------------------------------------------
+  l1-proxy:
+    image: python:3.12-alpine
+    container_name: exchange-l1-proxy
+    restart: unless-stopped
+    volumes:
+      - ./l1-proxy/proxy.py:/app/proxy.py:ro
+    environment:
+      UPSTREAM: ${L1_PROXY_UPSTREAM:?需要在 .env 设 L1_PROXY_UPSTREAM 指向 L1 结算链 RPC}
+    command: ["python3", "/app/proxy.py"]
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - |-
+          import urllib.request as u
+          r = u.urlopen(u.Request(
+              "http://127.0.0.1:8546",
+              data=b'{"jsonrpc":"2.0","id":1,"method":"eth_blobBaseFee","params":[]}',
+              headers={"Content-Type": "application/json"}
+          ), timeout=3)
+          assert b'"result"' in r.read()
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    logging: *default-logging
+    networks: [exchange]
+
+  # ---------------------------------------------------------------------------
+  # op-geth（L2 执行层，verifier 模式）
+  #   --rollup.sequencerhttp：写请求转发到项目方端点（本方案核心）
+  # ---------------------------------------------------------------------------
+  op-geth:
+    image: ${OP_GETH_IMAGE}
+    container_name: exchange-op-geth
+    restart: unless-stopped
+    stop_grace_period: 30s
+    entrypoint: ["/bin/sh", "/scripts/op-geth-entrypoint.sh"]
+    environment:
+      OP_GETH_STATE_SCHEME: ${OP_GETH_STATE_SCHEME:-path}
+    command:
+      - --datadir=/data/geth
+      - --networkid=${L2_CHAIN_ID}
+      - --syncmode=full
+      - --gcmode=${OP_GETH_GCMODE:-full}
+      - --state.scheme=${OP_GETH_STATE_SCHEME:-path}
+      - --cache=${OP_GETH_CACHE_MB:-8192}
+      - --http
+      - --http.addr=0.0.0.0
+      - --http.port=8545
+      - --http.corsdomain=*
+      - --http.vhosts=*
+      # 只保留读 + 写转发所需的 API
+      - --http.api=web3,eth,net,txpool
+      - --ws
+      - --ws.addr=0.0.0.0
+      - --ws.port=8546
+      - --ws.origins=*
+      - --ws.api=eth,net,txpool
+      - --authrpc.addr=0.0.0.0
+      - --authrpc.port=8551
+      - --authrpc.vhosts=*
+      - --authrpc.jwtsecret=/shared/jwt.txt
+      # ↓↓↓ 核心：写请求 HTTP 转发到项目方端点，转发失败同步报错 ↓↓↓
+      - --rollup.sequencerhttp=${L2_SEQUENCER_HTTP}
+      - --rollup.disabletxpoolgossip=true
+      - --nodiscover
+      - --maxpeers=0
+      - --txpool.pricelimit=1
+      - --verbosity=3
+    ports:
+      - "${BIND_HOST:-127.0.0.1}:${L2_RPC_PORT:-9545}:8545"
+      - "${BIND_HOST:-127.0.0.1}:${L2_WS_PORT:-9546}:8546"
+    volumes:
+      - opgeth-data:/data/geth
+      - ./workdir/shared:/shared:ro
+      - ./scripts/op-geth-entrypoint.sh:/scripts/op-geth-entrypoint.sh:ro
+    depends_on:
+      l1-proxy:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- --post-data '{\"jsonrpc\":\"2.0\",\"method\":\"eth_blockNumber\",\"params\":[],\"id\":1}' --header 'Content-Type: application/json' http://localhost:8545 | grep -q result"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
+    logging: *default-logging
+    networks: [exchange]
+
+  # ---------------------------------------------------------------------------
+  # op-node（L2 共识层，verifier 模式，从 L1 batch 推导 L2 区块）
+  # ---------------------------------------------------------------------------
+  op-node:
+    image: ${OP_NODE_IMAGE}
+    container_name: exchange-op-node
+    restart: unless-stopped
+    stop_grace_period: 30s
+    entrypoint: ["op-node"]
+    command:
+      - --l1=http://l1-proxy:8546
+      - --l1.rpckind=standard
+      - --l1.trustrpc=true
+      - --l1.beacon=none
+      - --l1.beacon.ignore=true
+      - --l2=http://op-geth:8551
+      - --l2.jwt-secret=/shared/jwt.txt
+      - --rollup.config=/shared/rollup.json
+      - --rollup.l1-chain-config=/shared/l1-chain-config.json
+      - --verifier.l1-confs=2
+      - --rpc.addr=0.0.0.0
+      - --rpc.port=8547
+      - --rpc.enable-admin
+      - --p2p.disable=false
+      - --p2p.listen.ip=0.0.0.0
+      - --p2p.listen.tcp=9222
+      - --p2p.priv.path=/data/opnode/opnode_p2p_priv.txt
+      - --p2p.peerstore.path=/data/opnode/peerstore
+      - --p2p.discovery.path=/data/opnode/discovery
+      - --safedb.path=/data/opnode/safedb
+      - --p2p.static=${L2_SEQUENCER_ENODE}
+      - --log.level=info
+    ports:
+      - "${BIND_HOST:-127.0.0.1}:${OP_NODE_RPC_PORT:-9547}:8547"
+    volumes:
+      - opnode-data:/data/opnode
+      - ./workdir/shared:/shared:ro
+    depends_on:
+      op-geth:
+        condition: service_healthy
+    logging: *default-logging
+    networks: [exchange]
+
+volumes:
+  opgeth-data:
+  opnode-data:
+
+networks:
+  exchange:
+    name: exchange-net
